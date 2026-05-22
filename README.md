@@ -22,10 +22,12 @@ sudo ./clean_linux.sh --list-sections
 
 ## Menú interactivo
 
-1. **Solo seguro** — APT, logs rotados, journal (riesgo BAJO)
+1. **Solo seguro** — APT, logs rotados, journal (riesgo BAJO). **No vacía la papelera.**
 2. **Sección a sección** — Todas las tareas con confirmación y etiqueta de riesgo
 3. **Perfil agresivo** — Papelera, man pages, truncar logs, kernels (con confirmación global + extra en ALTO)
 4. **Salir**
+
+Solo papelera: `sudo ./clean_linux.sh --section=trash`
 
 Cada sección muestra `Riesgo: BAJO|MEDIO|ALTO`, descripción, comandos y opciones `[s/n/a/q]`. En perfil agresivo, las secciones **ALTO** piden confirmación dos veces.
 

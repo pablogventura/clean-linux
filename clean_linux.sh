@@ -39,8 +39,8 @@ FILTER_SECTIONS=''
 # --- Utilidades ---
 
 log_msg() {
-	if [ -n "$LOG_FILE" ]; then
-		printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE"
+	if [ -n "$LOG_FILE" ] && touch "$LOG_FILE" 2>/dev/null; then
+		printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE" 2>/dev/null || true
 	fi
 }
 
@@ -318,50 +318,77 @@ run_section() {
 }
 
 # --- Espacio en disco (antes / después / ganancia) ---
+# Sin subshells pesados: evita cuelgues con disco casi lleno (fork / tmp).
 
-disk_read_df() {
-	# Salida: total_k used_k avail_k use_pct (entero, sin %)
-	df -k "$DISK_MOUNT" 2>/dev/null | awk 'NR==2 {
-		gsub(/%/, "", $5)
-		print $2, $3, $4, $5
-	}'
+disk_df_line() {
+	if command -v timeout >/dev/null 2>&1; then
+		timeout 8 df -kP "$DISK_MOUNT" 2>/dev/null | tail -n 1
+	else
+		df -kP "$DISK_MOUNT" 2>/dev/null | tail -n 1
+	fi
 }
 
-disk_human_size() {
-	# Convierte KiB a cadena legible (IEC)
-	_kb=$1
-	awk -v kb="$_kb" '
-		kb+0 < 1024 { printf "%d KiB", kb+0; exit }
-		kb+0 < 1048576 { printf "%.2f MiB", (kb+0)/1024; exit }
-		{ printf "%.2f GiB", (kb+0)/1048576 }
-	'
+disk_parse_df_line() {
+	_line=$1
+	_total_k=0
+	_used_k=0
+	_avail_k=0
+	_use_pct=0
+	[ -n "$_line" ] || return 1
+	# Una pasada awk (df -kP: dev blocks used avail capacity mount)
+	# shellcheck disable=SC2086
+	set -- $(printf '%s\n' "$_line" | awk '{gsub(/%/,"",$5); print $2+0,$3+0,$4+0,$5+0}')
+	_total_k=${1:-0}
+	_used_k=${2:-0}
+	_avail_k=${3:-0}
+	_use_pct=${4:-0}
+	return 0
 }
 
-disk_pct_free() {
-	_avail_k=$1
-	_total_k=$2
-	awk -v a="$_avail_k" -v t="$_total_k" 'BEGIN {
-		if (t+0 <= 0) { print "0.0"; exit }
-		printf "%.1f", (a+0)*100/(t+0)
-	}'
+disk_capture_from_line() {
+	_prefix=$1
+	_line=$2
+	if ! disk_parse_df_line "$_line"; then
+		eval "${_prefix}_TOTAL_K=0"
+		eval "${_prefix}_USED_K=0"
+		eval "${_prefix}_AVAIL_K=0"
+		eval "${_prefix}_USE_PCT=0"
+		return 1
+	fi
+	eval "${_prefix}_TOTAL_K=$_total_k"
+	eval "${_prefix}_USED_K=$_used_k"
+	eval "${_prefix}_AVAIL_K=$_avail_k"
+	eval "${_prefix}_USE_PCT=$_use_pct"
+	return 0
 }
 
 disk_capture_before() {
-	# shellcheck disable=SC2086
-	set -- $(disk_read_df)
-	DISK_BEFORE_TOTAL_K=${1:-0}
-	DISK_BEFORE_USED_K=${2:-0}
-	DISK_BEFORE_AVAIL_K=${3:-0}
-	DISK_BEFORE_USE_PCT=${4:-0}
+	_line=$(disk_df_line)
+	disk_capture_from_line DISK_BEFORE "$_line"
 }
 
 disk_capture_after() {
-	# shellcheck disable=SC2086
-	set -- $(disk_read_df)
-	DISK_AFTER_TOTAL_K=${1:-0}
-	DISK_AFTER_USED_K=${2:-0}
-	DISK_AFTER_AVAIL_K=${3:-0}
-	DISK_AFTER_USE_PCT=${4:-0}
+	_line=$(disk_df_line)
+	disk_capture_from_line DISK_AFTER "$_line"
+}
+
+# Imprime tamaño IEC sin command substitution (solo printf/arithmética)
+disk_print_human_kib() {
+	_kb=$1
+	if [ "$_kb" -lt 1024 ]; then
+		printf '%d KiB' "$_kb"
+	elif [ "$_kb" -lt 1048576 ]; then
+		_unit10=$((_kb * 100 / 1024))
+		printf '%d.%02d MiB' $((_unit10 / 100)) $((_unit10 % 100))
+	else
+		_unit10=$((_kb * 100 / 1048576))
+		printf '%d.%02d GiB' $((_unit10 / 100)) $((_unit10 % 100))
+	fi
+}
+
+disk_format_pct_x10() {
+	_x10=$1
+	printf '%d.%d' $((_x10 / 10)) $((_x10 % 10))
 }
 
 disk_print_row() {
@@ -370,37 +397,56 @@ disk_print_row() {
 	_used_k=$3
 	_avail_k=$4
 	_use_pct=$5
-	_free_pct=$(disk_pct_free "$_avail_k" "$_total_k")
-	_total_h=$(disk_human_size "$_total_k")
-	_used_h=$(disk_human_size "$_used_k")
-	_avail_h=$(disk_human_size "$_avail_k")
-	printf '    Total:  %s\n' "$_total_h"
-	printf '    Usado:  %s (%s%% del disco)\n' "$_used_h" "$_use_pct"
-	printf '    Libre:  %s (%s%% del disco)\n' "$_avail_h" "$_free_pct"
+	_free_x10=0
+	if [ "$_total_k" -gt 0 ]; then
+		_free_x10=$(( (_avail_k * 1000) / _total_k ))
+	fi
+
+	printf '    Total:  '
+	disk_print_human_kib "$_total_k"
+	printf '\n    Usado:  '
+	disk_print_human_kib "$_used_k"
+	printf ' (%s%% del disco)\n    Libre:  ' "$_use_pct"
+	disk_print_human_kib "$_avail_k"
+	printf ' ('
+	disk_format_pct_x10 "$_free_x10"
+	printf '%% del disco)\n'
 	log_msg "$_label mount=$DISK_MOUNT total=$_total_k used=$_used_k avail=$_avail_k use_pct=$_use_pct"
 }
 
 disk_show_before() {
-	disk_capture_before
+	if ! disk_capture_before; then
+		printf '\n=== Espacio en disco (%s) — ANTES ===\n' "$DISK_MOUNT"
+		printf '    (no se pudo leer df para %s)\n' "$DISK_MOUNT"
+		return 1
+	fi
 	printf '\n=== Espacio en disco (%s) — ANTES ===\n' "$DISK_MOUNT"
 	disk_print_row 'ANTES' \
 		"$DISK_BEFORE_TOTAL_K" "$DISK_BEFORE_USED_K" \
 		"$DISK_BEFORE_AVAIL_K" "$DISK_BEFORE_USE_PCT"
+	if [ "$DISK_BEFORE_USE_PCT" -ge 95 ] 2>/dev/null; then
+		printf '    Aviso: disco casi lleno (%% uso %s). La limpieza puede tardar más.\n' \
+			"$DISK_BEFORE_USE_PCT"
+	fi
 }
 
 disk_show_comparison() {
-	disk_capture_after
+	if ! disk_capture_after; then
+		printf '\n=== Espacio en disco (%s) — DESPUÉS ===\n' "$DISK_MOUNT"
+		printf '    (no se pudo leer df)\n'
+		return 1
+	fi
+
 	_delta_k=$((DISK_AFTER_AVAIL_K - DISK_BEFORE_AVAIL_K))
-	_delta_h=$(disk_human_size "$_delta_k")
-	_before_free_pct=$(disk_pct_free "$DISK_BEFORE_AVAIL_K" "$DISK_BEFORE_TOTAL_K")
-	_after_free_pct=$(disk_pct_free "$DISK_AFTER_AVAIL_K" "$DISK_AFTER_TOTAL_K")
-	_delta_pp=$(awk -v a="$_after_free_pct" -v b="$_before_free_pct" \
-		'BEGIN { printf "%.1f", a - b }')
-	_rel_pct=$(awk -v d="$_delta_k" -v b="$DISK_BEFORE_AVAIL_K" \
-		'BEGIN {
-			if (b+0 <= 0) { print "n/d"; exit }
-			printf "%.1f", (d+0)*100/(b+0)
-		}')
+	_before_x10=0
+	_after_x10=0
+	if [ "$DISK_BEFORE_TOTAL_K" -gt 0 ]; then
+		_before_x10=$(( (DISK_BEFORE_AVAIL_K * 1000) / DISK_BEFORE_TOTAL_K ))
+	fi
+	if [ "$DISK_AFTER_TOTAL_K" -gt 0 ]; then
+		_after_x10=$(( (DISK_AFTER_AVAIL_K * 1000) / DISK_AFTER_TOTAL_K ))
+	fi
+	_delta_pp_x10=$((_after_x10 - _before_x10))
 
 	printf '\n=== Espacio en disco (%s) — DESPUÉS ===\n' "$DISK_MOUNT"
 	disk_print_row 'DESPUÉS' \
@@ -409,22 +455,38 @@ disk_show_comparison() {
 
 	printf '\n=== Ganancia de espacio libre ===\n'
 	if [ "$_delta_k" -gt 0 ]; then
-		printf '    Libre recuperado: +%s\n' "$_delta_h"
-		printf '    %% libre del disco: %s%% → %s%% (+%s puntos)\n' \
-			"$_before_free_pct" "$_after_free_pct" "$_delta_pp"
-		if [ "$_rel_pct" != 'n/d' ]; then
-			printf '    Respecto al libre anterior: +%s%%\n' "$_rel_pct"
+		printf '    Libre recuperado: +'
+		disk_print_human_kib "$_delta_k"
+		printf '\n    %% libre del disco: '
+		disk_format_pct_x10 "$_before_x10"
+		printf '%% → '
+		disk_format_pct_x10 "$_after_x10"
+		printf '%% (+'
+		disk_format_pct_x10 "$_delta_pp_x10"
+		printf ' puntos)\n'
+		if [ "$DISK_BEFORE_AVAIL_K" -gt 0 ]; then
+			_rel_x10=$((_delta_k * 1000 / DISK_BEFORE_AVAIL_K))
+			printf '    Respecto al libre anterior: +'
+			disk_format_pct_x10 "$_rel_x10"
+			printf '%%\n'
 		fi
 	elif [ "$_delta_k" -lt 0 ]; then
-		_neg_h=$(disk_human_size "$((0 - _delta_k))")
-		printf '    Libre: -%s (el disco tiene menos libre que al inicio)\n' "$_neg_h"
-		printf '    %% libre del disco: %s%% → %s%% (%s puntos)\n' \
-			"$_before_free_pct" "$_after_free_pct" "$_delta_pp"
+		_neg_k=$((0 - _delta_k))
+		printf '    Libre: -'
+		disk_print_human_kib "$_neg_k"
+		printf ' (menos libre que al inicio)\n    %% libre del disco: '
+		disk_format_pct_x10 "$_before_x10"
+		printf '%% → '
+		disk_format_pct_x10 "$_after_x10"
+		printf '%% ('
+		disk_format_pct_x10 "$_delta_pp_x10"
+		printf ' puntos)\n'
 	else
-		printf '    Sin cambio en espacio libre.\n'
-		printf '    %% libre del disco: %s%%\n' "$_after_free_pct"
+		printf '    Sin cambio en espacio libre.\n    %% libre del disco: '
+		disk_format_pct_x10 "$_after_x10"
+		printf '%%\n'
 	fi
-	log_msg "GANANCIA delta_avail_k=$_delta_k delta_pp=$_delta_pp rel_pct=$_rel_pct"
+	log_msg "GANANCIA delta_avail_k=$_delta_k"
 }
 
 do_apt_show_cache() {
@@ -505,16 +567,43 @@ do_journal_vacuum() {
 	fi
 }
 
+trash_empty_dir_contents() {
+	_dir=$1
+	[ -d "$_dir" ] || return 0
+	if [ "$DRY_RUN" -eq 1 ]; then
+		_n=$(find "$_dir" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')
+		printf '  [DRY-RUN] vaciar %s (%s entradas)\n' "$_dir" "${_n:-0}"
+		return 0
+	fi
+	find "$_dir" -mindepth 1 -delete 2>/dev/null || true
+}
+
 do_trash() {
+	_found=0
 	for _home in /home/* /root; do
+		[ -e "$_home" ] || continue
+		[ -d "$_home" ] || continue
 		_trash="$_home/.local/share/Trash"
 		if [ -d "$_trash" ]; then
-			find "$_trash" -mindepth 1 -maxdepth 1 -print0 2>/dev/null |
-				while IFS= read -r -d '' _item; do
-					run_cmd rm -rf "$_item"
-				done
+			_found=1
+			trash_empty_dir_contents "$_trash/files"
+			trash_empty_dir_contents "$_trash/info"
+			trash_empty_dir_contents "$_trash/expunged"
+			printf '  Papelera XDG vaciada: %s\n' "$_trash"
+		fi
+		if [ -d "$_home/.Trash" ]; then
+			_found=1
+			if [ "$DRY_RUN" -eq 1 ]; then
+				printf '  [DRY-RUN] vaciar %s/.Trash\n' "$_home"
+			else
+				find "$_home/.Trash" -mindepth 1 -delete 2>/dev/null || true
+			fi
+			printf '  Papelera legacy vaciada: %s/.Trash\n' "$_home"
 		fi
 	done
+	if [ "$_found" -eq 0 ]; then
+		printf '  No se encontraron carpetas de papelera en /home/* ni /root.\n'
+	fi
 }
 
 do_user_cache() {
@@ -792,9 +881,9 @@ run_all_sections() {
 		"journalctl --vacuum-time=${JOURNAL_DAYS}d"
 
 	run_section trash medium \
-		'Vacia la papelera de TODOS los usuarios en /home y de root.' \
-		'rm -rf .../Trash/*' \
-		'ADVERTENCIA: archivos eliminados de la papelera no se recuperan fácilmente.'
+		'Vacia la papelera de TODOS los usuarios en /home y de root (Trash/files, Trash/info, ~/.Trash).' \
+		'find ~/.local/share/Trash/files -mindepth 1 -delete' \
+		'ADVERTENCIA: archivos eliminados de la papelera no se recuperan fácilmente. No está en el menú [1] Solo seguro.'
 
 	run_section user_cache medium \
 		'Borra el contenido de ~/.cache del usuario que invocó sudo.' \
