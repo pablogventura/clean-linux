@@ -25,17 +25,17 @@ sudo ./clean_linux.sh --list-sections
 3. **Perfil agresivo** — Papelera, man pages, truncar logs, kernels (con confirmación global + extra en ALTO)
 4. **Salir**
 
-Cada sección muestra `Riesgo: BAJO|MEDIO|ALTO`, descripción, comandos y opciones `[s/n/a/q]`.
+Cada sección muestra `Riesgo: BAJO|MEDIO|ALTO`, descripción, comandos y opciones `[s/n/a/q]`. En perfil agresivo, las secciones **ALTO** piden confirmación dos veces.
 
 ## Opciones
 
 | Opción | Descripción |
 |--------|-------------|
-| `-n`, `--dry-run` | No modifica el sistema (salvo `apt-get -s autoremove`, inofensivo) |
+| `-n`, `--dry-run` | No modifica el sistema; ejecuta `apt-get -s autoremove` para mostrar vista previa |
 | `-y`, `--yes` | Sin preguntas |
 | `--only-safe` | Solo secciones de riesgo bajo |
 | `--aggressive` | Bloque agresivo (ver README) |
-| `--section=ID` | Solo esa sección (repetible) |
+| `--section=ID` | Solo esa sección (repetible; pregunta si hay terminal) |
 | `--with-legacy` | Incluye `legacy_purge` (software-properties-common) |
 | `--list-sections` | Lista IDs y riesgos |
 | `--log-file=RUTA` | Registro con marcas de tiempo |

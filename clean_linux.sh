@@ -24,7 +24,6 @@ INTERACTIVE=0
 AUTO_ACCEPT_RISK='' # low | medium | high
 AGGRESSIVE_OK=0
 FILTER_SECTIONS=''
-SECTIONS_TO_RUN=''
 
 # --- Utilidades ---
 
@@ -236,8 +235,8 @@ confirm_section() {
 	fi
 
 	if ! is_tty || [ "$INTERACTIVE" -eq 0 ]; then
-		if [ "$ASSUME_YES" -eq 0 ] && [ "$AGGRESSIVE" -eq 0 ]; then
-			printf 'Omitido: %s (sin TTY interactivo; usa -y o --section=)\n' "$_id"
+		if [ "$ASSUME_YES" -eq 0 ]; then
+			printf 'Omitido: %s (sin TTY interactivo; usa -y)\n' "$_id"
 			return 1
 		fi
 		return 0
@@ -252,14 +251,22 @@ confirm_section() {
 	# shellcheck disable=SC2086
 	printf '  Comando(s): %s\n' $_cmds
 
-	if [ "$_risk" = 'high' ] && [ "$AGGRESSIVE_OK" -eq 1 ]; then
-		printf '  (Confirmación adicional por riesgo ALTO)\n'
-	fi
-
 	printf '  ¿Ejecutar? [s]í / [n]o / [a] resto riesgo %s / [q]uit: ' "$(risk_label_es "$_risk")"
 	read -r _ans || _ans='n'
 	case "$_ans" in
 	s | S | y | Y | sí | si)
+		if [ "$_risk" = 'high' ] && [ "$AGGRESSIVE_OK" -eq 1 ]; then
+			printf '\n  *** Confirmación adicional (riesgo ALTO): %s ***\n' "$_id"
+			printf '  ¿Seguro que quieres ejecutar? [s/n]: '
+			read -r _ans2 || _ans2='n'
+			case "$_ans2" in
+			s | S | y | Y | sí | si) return 0 ;;
+			*)
+				printf 'Omitido: %s (rechazado en 2.ª confirmación)\n' "$_id"
+				return 1
+				;;
+			esac
+		fi
 		return 0
 		;;
 	a | A)
@@ -320,36 +327,39 @@ do_apt_cache() {
 	run_cmd apt-get autoclean
 }
 
-do_apt_autoremove() {
+apt_autoremove_preview() {
 	_preview_out=$(mktemp)
-	trap 'rm -f "$_preview_out"' EXIT INT HUP
-
-	if [ "$DRY_RUN" -eq 1 ]; then
-		printf '  [DRY-RUN] apt-get -s autoremove\n'
-		printf '  [DRY-RUN] apt-get autoremove -y\n'
-		rm -f "$_preview_out"
-		trap - EXIT INT HUP
-		return 0
-	fi
-
 	apt-get -s autoremove >"$_preview_out" 2>&1 || true
 	printf '\n  --- Vista previa (apt-get -s autoremove) ---\n'
-	if [ ! -s "$_preview_out" ] ||
-		! grep -qiE 'will be REMOVED|REMOVERÁN|serán eliminados|to remove' "$_preview_out" 2>/dev/null; then
-		printf '  (ningún paquete para eliminar)\n'
+	if [ -s "$_preview_out" ] &&
+		grep -qiE 'will be REMOVED|REMOVERÁN|serán eliminados|to remove' "$_preview_out" 2>/dev/null; then
+		sed 's/^/  /' <"$_preview_out"
 		rm -f "$_preview_out"
-		trap - EXIT INT HUP
+		return 0
+	fi
+	printf '  (ningún paquete para eliminar)\n'
+	rm -f "$_preview_out"
+	return 1
+}
+
+do_apt_autoremove() {
+	if ! apt_autoremove_preview; then
 		if [ "$SKIP_EMPTY_AUTOREMOVE" -eq 1 ]; then
 			return 0
 		fi
 		if [ "$INTERACTIVE" -eq 1 ] && is_tty && [ "$ASSUME_YES" -eq 0 ]; then
 			return 0
 		fi
+		if [ "$DRY_RUN" -eq 1 ]; then
+			printf '  [DRY-RUN] apt-get autoremove -y (no aplicable; simulación vacía)\n'
+		fi
 		return 0
 	fi
-	sed 's/^/  /' <"$_preview_out"
-	rm -f "$_preview_out"
-	trap - EXIT INT HUP
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		printf '  [DRY-RUN] apt-get autoremove -y\n'
+		return 0
+	fi
 
 	if [ "$INTERACTIVE" -eq 1 ] && is_tty && [ "$ASSUME_YES" -eq 0 ]; then
 		printf '  ¿Continuar con autoremove real? [s/n]: '
@@ -723,7 +733,7 @@ Opciones:
   -y, --yes                  No preguntar (aceptar secciones activas)
   --only-safe                Solo secciones de riesgo BAJO
   --aggressive               Perfil agresivo (+ confirmación en ALTO)
-  --section=ID               Limitar a sección(es); repetible
+  --section=ID               Limitar a sección(es); repetible (pregunta si hay TTY)
   --with-legacy              Incluye legacy_purge (software-properties-common)
   --list-sections            Lista IDs y niveles de riesgo
   --log-file=RUTA            Registro de acciones
@@ -812,8 +822,7 @@ main() {
 		ASSUME_YES=1
 	fi
 
-	if is_tty && [ "$ASSUME_YES" -eq 0 ] && [ -z "$FILTER_SECTIONS" ] &&
-		[ "$ONLY_SAFE" -eq 0 ] && [ "$AGGRESSIVE" -eq 0 ]; then
+	if is_tty && [ "$ASSUME_YES" -eq 0 ]; then
 		INTERACTIVE=1
 	fi
 
@@ -823,7 +832,8 @@ main() {
 		MENU_MODE=safe
 	fi
 
-	if [ "$INTERACTIVE" -eq 1 ] && [ -z "$MENU_MODE" ]; then
+	if [ "$INTERACTIVE" -eq 1 ] && [ -z "$FILTER_SECTIONS" ] &&
+		[ "$ONLY_SAFE" -eq 0 ] && [ "$AGGRESSIVE" -eq 0 ] && [ -z "$MENU_MODE" ]; then
 		show_initial_menu
 	fi
 
