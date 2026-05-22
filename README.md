@@ -8,6 +8,8 @@ Script de limpieza para **Debian/Ubuntu** con confirmación interactiva, niveles
 - Utilidades **GNU** (`find`, `head`, `sort`, `xargs -r`, `fuser`)
 - Opcionales: `snap`, `flatpak`, `deborphan`, `journalctl`
 
+Al inicio y al final muestra **espacio usado y libre** en la partición `/` (o `DISK_MOUNT`), y la **ganancia** en tamaño y porcentaje.
+
 ## Uso rápido
 
 ```bash
@@ -47,6 +49,7 @@ Cada sección muestra `Riesgo: BAJO|MEDIO|ALTO`, descripción, comandos y opcion
 |----------|---------|-----|
 | `JOURNAL_DAYS` | `7` | `journalctl --vacuum-time` |
 | `KEEP_KERNELS` | `2` | Versiones de kernel a conservar |
+| `DISK_MOUNT` | `/` | Punto de montaje para el informe antes/después |
 | `NO_COLOR` | — | Desactiva colores en TTY |
 
 ## Secciones

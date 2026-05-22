@@ -9,6 +9,17 @@ VERSION='2.0.0'
 # --- Configuración (env) ---
 JOURNAL_DAYS="${JOURNAL_DAYS:-7}"
 KEEP_KERNELS="${KEEP_KERNELS:-2}"
+DISK_MOUNT="${DISK_MOUNT:-/}"
+
+# Instantánea de disco (KiB y %% uso), antes/después
+DISK_BEFORE_TOTAL_K=0
+DISK_BEFORE_USED_K=0
+DISK_BEFORE_AVAIL_K=0
+DISK_BEFORE_USE_PCT=0
+DISK_AFTER_TOTAL_K=0
+DISK_AFTER_USED_K=0
+DISK_AFTER_AVAIL_K=0
+DISK_AFTER_USE_PCT=0
 
 # --- Flags globales ---
 DRY_RUN=0
@@ -306,11 +317,114 @@ run_section() {
 	}
 }
 
-# --- Secciones informativas ---
+# --- Espacio en disco (antes / después / ganancia) ---
 
-do_disk_info() {
-	printf '\n=== Espacio en disco ===\n'
-	df -h / /home 2>/dev/null || df -h /
+disk_read_df() {
+	# Salida: total_k used_k avail_k use_pct (entero, sin %)
+	df -k "$DISK_MOUNT" 2>/dev/null | awk 'NR==2 {
+		gsub(/%/, "", $5)
+		print $2, $3, $4, $5
+	}'
+}
+
+disk_human_size() {
+	# Convierte KiB a cadena legible (IEC)
+	_kb=$1
+	awk -v kb="$_kb" '
+		kb+0 < 1024 { printf "%d KiB", kb+0; exit }
+		kb+0 < 1048576 { printf "%.2f MiB", (kb+0)/1024; exit }
+		{ printf "%.2f GiB", (kb+0)/1048576 }
+	'
+}
+
+disk_pct_free() {
+	_avail_k=$1
+	_total_k=$2
+	awk -v a="$_avail_k" -v t="$_total_k" 'BEGIN {
+		if (t+0 <= 0) { print "0.0"; exit }
+		printf "%.1f", (a+0)*100/(t+0)
+	}'
+}
+
+disk_capture_before() {
+	# shellcheck disable=SC2086
+	set -- $(disk_read_df)
+	DISK_BEFORE_TOTAL_K=${1:-0}
+	DISK_BEFORE_USED_K=${2:-0}
+	DISK_BEFORE_AVAIL_K=${3:-0}
+	DISK_BEFORE_USE_PCT=${4:-0}
+}
+
+disk_capture_after() {
+	# shellcheck disable=SC2086
+	set -- $(disk_read_df)
+	DISK_AFTER_TOTAL_K=${1:-0}
+	DISK_AFTER_USED_K=${2:-0}
+	DISK_AFTER_AVAIL_K=${3:-0}
+	DISK_AFTER_USE_PCT=${4:-0}
+}
+
+disk_print_row() {
+	_label=$1
+	_total_k=$2
+	_used_k=$3
+	_avail_k=$4
+	_use_pct=$5
+	_free_pct=$(disk_pct_free "$_avail_k" "$_total_k")
+	_total_h=$(disk_human_size "$_total_k")
+	_used_h=$(disk_human_size "$_used_k")
+	_avail_h=$(disk_human_size "$_avail_k")
+	printf '    Total:  %s\n' "$_total_h"
+	printf '    Usado:  %s (%s%% del disco)\n' "$_used_h" "$_use_pct"
+	printf '    Libre:  %s (%s%% del disco)\n' "$_avail_h" "$_free_pct"
+	log_msg "$_label mount=$DISK_MOUNT total=$_total_k used=$_used_k avail=$_avail_k use_pct=$_use_pct"
+}
+
+disk_show_before() {
+	disk_capture_before
+	printf '\n=== Espacio en disco (%s) — ANTES ===\n' "$DISK_MOUNT"
+	disk_print_row 'ANTES' \
+		"$DISK_BEFORE_TOTAL_K" "$DISK_BEFORE_USED_K" \
+		"$DISK_BEFORE_AVAIL_K" "$DISK_BEFORE_USE_PCT"
+}
+
+disk_show_comparison() {
+	disk_capture_after
+	_delta_k=$((DISK_AFTER_AVAIL_K - DISK_BEFORE_AVAIL_K))
+	_delta_h=$(disk_human_size "$_delta_k")
+	_before_free_pct=$(disk_pct_free "$DISK_BEFORE_AVAIL_K" "$DISK_BEFORE_TOTAL_K")
+	_after_free_pct=$(disk_pct_free "$DISK_AFTER_AVAIL_K" "$DISK_AFTER_TOTAL_K")
+	_delta_pp=$(awk -v a="$_after_free_pct" -v b="$_before_free_pct" \
+		'BEGIN { printf "%.1f", a - b }')
+	_rel_pct=$(awk -v d="$_delta_k" -v b="$DISK_BEFORE_AVAIL_K" \
+		'BEGIN {
+			if (b+0 <= 0) { print "n/d"; exit }
+			printf "%.1f", (d+0)*100/(b+0)
+		}')
+
+	printf '\n=== Espacio en disco (%s) — DESPUÉS ===\n' "$DISK_MOUNT"
+	disk_print_row 'DESPUÉS' \
+		"$DISK_AFTER_TOTAL_K" "$DISK_AFTER_USED_K" \
+		"$DISK_AFTER_AVAIL_K" "$DISK_AFTER_USE_PCT"
+
+	printf '\n=== Ganancia de espacio libre ===\n'
+	if [ "$_delta_k" -gt 0 ]; then
+		printf '    Libre recuperado: +%s\n' "$_delta_h"
+		printf '    %% libre del disco: %s%% → %s%% (+%s puntos)\n' \
+			"$_before_free_pct" "$_after_free_pct" "$_delta_pp"
+		if [ "$_rel_pct" != 'n/d' ]; then
+			printf '    Respecto al libre anterior: +%s%%\n' "$_rel_pct"
+		fi
+	elif [ "$_delta_k" -lt 0 ]; then
+		_neg_h=$(disk_human_size "$((0 - _delta_k))")
+		printf '    Libre: -%s (el disco tiene menos libre que al inicio)\n' "$_neg_h"
+		printf '    %% libre del disco: %s%% → %s%% (%s puntos)\n' \
+			"$_before_free_pct" "$_after_free_pct" "$_delta_pp"
+	else
+		printf '    Sin cambio en espacio libre.\n'
+		printf '    %% libre del disco: %s%%\n' "$_after_free_pct"
+	fi
+	log_msg "GANANCIA delta_avail_k=$_delta_k delta_pp=$_delta_pp rel_pct=$_rel_pct"
 }
 
 do_apt_show_cache() {
@@ -656,7 +770,7 @@ list_all_sections() {
 }
 
 run_all_sections() {
-	do_disk_info
+	disk_show_before
 	run_section apt_show_cache none \
 		'Tamaño de la caché de paquetes APT.' \
 		'du -sh /var/cache/apt/archives'
@@ -742,6 +856,7 @@ Opciones:
 Variables de entorno:
   JOURNAL_DAYS=7             Retención journalctl
   KEEP_KERNELS=2             Versiones de kernel a conservar
+  DISK_MOUNT=/               Partición para medir espacio (default /)
   NO_COLOR=1                 Sin colores ANSI
 
 Ejemplos:
@@ -851,7 +966,7 @@ main() {
 	run_all_sections
 
 	printf '\n=== Resumen final ===\n'
-	do_disk_info
+	disk_show_comparison
 	do_apt_show_cache
 	printf '\nLimpieza finalizada.\n'
 	log_msg 'Fin'
